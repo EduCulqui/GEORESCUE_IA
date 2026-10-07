@@ -41,6 +41,9 @@ class UserSubscription(Base):
     expires_at = Column(DateTime, nullable=True)
     checkout_session_id = Column(String(200), nullable=True)
     customer_id = Column(String(200), nullable=True)
+    # Pago reportado por el usuario (Yape, Plin o transferencia) para validación manual.
+    payment_method = Column(String(40), nullable=True)
+    payment_reference = Column(String(120), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 

@@ -17,8 +17,16 @@ class PlanItem(BaseModel):
 
 
 class CreateCheckoutRequest(BaseModel):
-    usuario: str = Field(..., min_length=3, max_length=100)
+    # El usuario real se toma del token de sesión; este campo se acepta solo por compatibilidad.
+    usuario: Optional[str] = Field(default=None, max_length=100)
     plan_code: str = Field(..., min_length=2, max_length=50)
+    # Pago reportado (obligatorio en planes de pago cuando no hay pasarela configurada).
+    payment_method: Optional[str] = Field(default=None, max_length=40)
+    payment_reference: Optional[str] = Field(default=None, max_length=120)
+
+
+class ConfirmCheckoutRequest(BaseModel):
+    session_id: str = Field(..., min_length=5, max_length=200)
 
 
 class CheckoutSessionResponse(BaseModel):
@@ -40,6 +48,39 @@ class SubscriptionStatusResponse(BaseModel):
     currency: str = "PEN"
     started_at: Optional[str] = None
     expires_at: Optional[str] = None
+    # Solicitud de cambio de plan que aún no está pagada/validada (si existe).
+    pending_plan_code: Optional[str] = None
+    pending_status: Optional[str] = None
+
+
+class PaymentReviewItem(BaseModel):
+    id: int
+    usuario: str
+    plan_code: str
+    status: str
+    provider: str
+    price: float
+    currency: str = "PEN"
+    created_at: Optional[str] = None
+    payment_method: Optional[str] = None
+    payment_reference: Optional[str] = None
+
+
+class PaymentMethodInfo(BaseModel):
+    code: str
+    label: str
+    destination: str
+
+
+class PaymentInfoResponse(BaseModel):
+    # "manual": el usuario paga por fuera y reporta la operación. "stripe": checkout en la pasarela.
+    gateway: str
+    account_holder: str
+    methods: List[PaymentMethodInfo]
+
+
+class PaymentReviewRequest(BaseModel):
+    review_notes: Optional[str] = Field(default=None, max_length=500)
 
 
 class InstitutionMemberRequest(BaseModel):

@@ -1,4 +1,5 @@
 import hmac
+import json
 from datetime import timedelta
 from urllib.parse import urlparse
 
@@ -6,7 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.security import create_access_token, decode_access_token
+from app.core.security import build_permissions_for_role, create_access_token, decode_access_token
 from app.db.session import get_db
 from app.models.subscription import InstitutionAccount, InstitutionApplication, PlatformAdminAccount
 from app.models.user import Usuario
@@ -20,6 +21,8 @@ from app.schemas.admin import (
     OwnerPasswordChangeRequest,
 )
 from app.core.security import hash_password, verify_password
+from app.schemas.subscription import PaymentReviewItem
+from app.services.subscription_service import SubscriptionService
 
 router = APIRouter(prefix="/admin", tags=["Administración de plataforma"])
 
@@ -137,10 +140,11 @@ def aprobar_solicitud(
     ).first()
     applicant = db.query(Usuario).filter(
         Usuario.usuario == application.applicant_username,
-        Usuario.institucion == application.institution_name,
-        Usuario.is_active == 0,
     ).first()
-    if not account or not applicant:
+    # El solicitante es una cuenta nueva (director desactivado de esta institución) o un
+    # ciudadano que pidió la conversión y sigue como 'individual'. Cualquier otra cosa es un conflicto.
+    applicant_institution = getattr(applicant, "institucion", None) or "individual"
+    if not account or not applicant or applicant_institution not in ("individual", application.institution_name):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No se encontró la cuenta pendiente asociada a esta solicitud.")
 
     from datetime import datetime
@@ -152,6 +156,9 @@ def aprobar_solicitud(
     application.reviewed_by = owner.get("sub", "platform-owner")
     application.reviewed_at = reviewed_at
     account.is_active = True
+    applicant.rol = "director"
+    applicant.institucion = application.institution_name
+    applicant.permisos = json.dumps(build_permissions_for_role("director"))
     applicant.is_active = 1
     db.add_all([application, account, applicant])
     db.commit()
@@ -195,3 +202,56 @@ def rechazar_solicitud(
         reviewed_at=reviewed_at,
         message="Solicitud rechazada. La cuenta y el usuario permanecen desactivados.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Validación manual de pagos (cuando no hay pasarela Stripe configurada)
+# ---------------------------------------------------------------------------
+def _payment_item(subscription) -> PaymentReviewItem:
+    return PaymentReviewItem(
+        id=subscription.id,
+        usuario=subscription.usuario,
+        plan_code=subscription.plan_code,
+        status=subscription.status,
+        provider=subscription.provider,
+        price=float(subscription.price or 0.0),
+        currency=subscription.currency or "PEN",
+        created_at=subscription.created_at.isoformat() if subscription.created_at else None,
+        payment_method=getattr(subscription, "payment_method", None),
+        payment_reference=getattr(subscription, "payment_reference", None),
+    )
+
+
+@router.get("/payments", response_model=list[PaymentReviewItem])
+def listar_pagos(
+    status_filter: str = "manual_review",
+    _: dict = Depends(require_rotated_platform_owner),
+    db: Session = Depends(get_db),
+):
+    if status_filter not in {"manual_review", "pending", "active", "rejected", "replaced", "all"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Filtro de estado inválido.")
+    return [_payment_item(item) for item in SubscriptionService(db).list_payment_requests(status_filter)]
+
+
+@router.post("/payments/{subscription_id}/approve", response_model=PaymentReviewItem)
+def aprobar_pago(
+    subscription_id: int,
+    _: dict = Depends(require_rotated_platform_owner),
+    db: Session = Depends(get_db),
+):
+    try:
+        return _payment_item(SubscriptionService(db).review_payment(subscription_id, approve=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.post("/payments/{subscription_id}/reject", response_model=PaymentReviewItem)
+def rechazar_pago(
+    subscription_id: int,
+    _: dict = Depends(require_rotated_platform_owner),
+    db: Session = Depends(get_db),
+):
+    try:
+        return _payment_item(SubscriptionService(db).review_payment(subscription_id, approve=False))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc

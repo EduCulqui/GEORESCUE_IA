@@ -99,6 +99,48 @@ Y abre tu navegador en **http://localhost:3000**.
 
 ---
 
+## ✅ Pruebas Automatizadas
+
+Las pruebas usan SQLite en memoria: no necesitan PostgreSQL/PostGIS ni tocan la base de desarrollo.
+
+```powershell
+cd backend
+pip install -r requirements.txt
+python -m pytest tests -v
+```
+
+`tests/test_flujos_e2e.py` recorre por HTTP los flujos completos (casos CP-01 a CP-35):
+
+| Casos | Flujo |
+|---|---|
+| CP-01 a CP-07 | Registro e inicio de sesión del ciudadano |
+| CP-08 a CP-12 | Acceso del propietario: clave temporal `admin` y cambio obligatorio |
+| CP-13 a CP-24 | Registro institucional, aprobación/rechazo, invitaciones, roles y aislamiento entre instituciones |
+| CP-25 a CP-34 | Planes y pagos (validación manual y Stripe simulado) |
+| CP-35 | Red familiar |
+| CP-36 a CP-40 | Pago reportado por el usuario (Yape / Plin / transferencia) |
+
+Los endpoints que dependen de PostGIS (alertas, coacción, antirrobo) no están cubiertos por esta suite.
+
+## 💳 Pagos
+
+El precio de cada plan se define en un solo lugar (`ensure_default_plans` en
+`backend/app/services/subscription_service.py`); la tarjeta, el formulario y el panel del propietario lo leen de ahí.
+
+1. El usuario elige un plan (en la pantalla de acceso o con el botón **Mejorar a Pro** de su panel).
+   Si no ha iniciado sesión, se le pide hacerlo y el formulario se abre al entrar.
+2. **Pago reportado (por defecto):** el formulario muestra el monto y los datos de cobro (Yape, Plin o
+   transferencia). El usuario paga por fuera y registra el medio y el número de operación. La solicitud queda
+   "en validación" hasta que el propietario la aprueba o rechaza en
+   *Administración de propietarios → Pagos por validar*, donde ve el medio, el número de operación y el monto.
+   Un mismo número de operación no puede usarse en dos cuentas.
+3. Los datos de cobro se configuran en `.env` (`PAYMENT_ACCOUNT_HOLDER`, `PAYMENT_YAPE_NUMBER`,
+   `PAYMENT_PLIN_NUMBER`, `PAYMENT_BANK_ACCOUNT`). Los valores por defecto son de ejemplo.
+4. **Con `STRIPE_SECRET_KEY`** no se muestra el formulario: se redirige al checkout de la pasarela y, al volver,
+   el backend activa el plan solo si el pago figura como pagado (`POST /api/v1/subscriptions/checkout/confirm`).
+
+---
+
 ## 🛡️ Seguridad Implementada
 * **Hash de contraseñas**: Algoritmo `PBKDF2-HMAC-SHA256` con sal criptográfica aleatoria de 16 bytes y 100,000 iteraciones (librería estándar, sin vulnerabilidades de texto plano).
 * **Compatibilidad de migración**: Detección inteligente para cuentas de prueba previas.

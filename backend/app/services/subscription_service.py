@@ -13,6 +13,8 @@ from app.schemas.subscription import (
     CheckoutSessionResponse,
     CreateCheckoutRequest,
     InstitutionMemberResponse,
+    PaymentInfoResponse,
+    PaymentMethodInfo,
     InstitutionPricingResponse,
     PlanItem,
     SubscriptionStatusResponse,
@@ -47,7 +49,7 @@ class SubscriptionService:
             {
                 "code": "pro",
                 "name": "Pro",
-                "price": 89.0,
+                "price": 39.0,
                 "currency": "PEN",
                 "interval": "monthly",
                 "tier": "pro",
@@ -422,91 +424,248 @@ class SubscriptionService:
             created_at=member.created_at.isoformat() if member.created_at else None,
         )
 
+    # ------------------------------------------------------------------
+    # Pagos de planes individuales (ciudadano)
+    # ------------------------------------------------------------------
+    ESTADOS_EN_CURSO = ("pending", "manual_review")
+    METODOS_DE_PAGO = {"yape": "Yape", "plin": "Plin", "transferencia": "Transferencia bancaria"}
+
+    def _stripe_enabled(self) -> bool:
+        return bool(settings.STRIPE_SECRET_KEY) and stripe is not None
+
+    def get_payment_info(self) -> PaymentInfoResponse:
+        """Datos que el usuario necesita para pagar por fuera y reportar la operación."""
+        destinos = {
+            "yape": settings.PAYMENT_YAPE_NUMBER,
+            "plin": settings.PAYMENT_PLIN_NUMBER,
+            "transferencia": settings.PAYMENT_BANK_ACCOUNT,
+        }
+        return PaymentInfoResponse(
+            gateway="stripe" if self._stripe_enabled() else "manual",
+            account_holder=settings.PAYMENT_ACCOUNT_HOLDER,
+            methods=[
+                PaymentMethodInfo(code=code, label=label, destination=destinos[code])
+                for code, label in self.METODOS_DE_PAGO.items()
+            ],
+        )
+
+    def _validar_pago_reportado(self, request: CreateCheckoutRequest, usuario: str) -> tuple[str, str]:
+        metodo = (request.payment_method or "").strip().lower()
+        referencia = " ".join((request.payment_reference or "").split())
+        if metodo not in self.METODOS_DE_PAGO:
+            raise ValueError("Elige el método con el que pagaste: Yape, Plin o transferencia.")
+        if len(referencia) < 4:
+            raise ValueError("Escribe el número de operación que aparece en tu comprobante de pago.")
+        # Un mismo comprobante no puede usarse para dos solicitudes distintas.
+        repetido = self.db.query(UserSubscription).filter(
+            UserSubscription.payment_method == metodo,
+            UserSubscription.payment_reference == referencia,
+            UserSubscription.status.in_(("manual_review", "active", "replaced")),
+            UserSubscription.usuario != usuario,
+        ).first()
+        if repetido:
+            raise ValueError("Ese número de operación ya fue registrado por otra cuenta.")
+        return metodo, referencia
+
+    def _open_request(self, usuario: str) -> Optional[UserSubscription]:
+        """Solicitud de plan que aún no está pagada ni validada (como máximo una por usuario)."""
+        return self.db.query(UserSubscription).filter(
+            UserSubscription.usuario == usuario,
+            UserSubscription.status.in_(self.ESTADOS_EN_CURSO),
+        ).order_by(UserSubscription.id.desc()).first()
+
+    def _active_subscription(self, usuario: str) -> Optional[UserSubscription]:
+        now = datetime.utcnow()
+        candidates = self.db.query(UserSubscription).filter(
+            UserSubscription.usuario == usuario,
+            UserSubscription.status == "active",
+        ).order_by(UserSubscription.id.desc()).all()
+        for item in candidates:
+            if item.expires_at is None or item.expires_at > now:
+                return item
+        return None
+
+    def _activate(self, subscription: UserSubscription) -> None:
+        """Activa una suscripción y reemplaza la que estuviera vigente."""
+        now = datetime.utcnow()
+        self.db.add(subscription)
+        self.db.flush()  # asegura que la fila nueva ya tenga id antes de compararla
+        previous = self.db.query(UserSubscription).filter(
+            UserSubscription.usuario == subscription.usuario,
+            UserSubscription.status == "active",
+            UserSubscription.id != subscription.id,
+        ).all()
+        for item in previous:
+            item.status = "replaced"
+            self.db.add(item)
+        subscription.status = "active"
+        subscription.started_at = now
+        subscription.expires_at = None if float(subscription.price or 0) == 0 else now + timedelta(days=30)
+        self.db.add(subscription)
+
     def create_checkout(self, request: CreateCheckoutRequest) -> CheckoutSessionResponse:
+        usuario = (request.usuario or "").strip()
+        if not usuario:
+            raise ValueError("Inicia sesión para elegir un plan.")
+        account = self.db.query(Usuario).filter(Usuario.usuario == usuario).first()
+        if not account or not getattr(account, "is_active", 1):
+            raise ValueError("La cuenta no existe o está desactivada.")
+        if (getattr(account, "institucion", None) or "individual") != "individual":
+            raise ValueError("Las cuentas institucionales gestionan su plan desde el panel de la institución.")
+
         plan = self.get_plan_by_code(request.plan_code)
         if not plan:
             raise ValueError(f"El plan '{request.plan_code}' no existe o no está habilitado.")
-
-        if settings.STRIPE_SECRET_KEY and stripe is not None:
-            stripe.api_key = settings.STRIPE_SECRET_KEY
-            session = stripe.checkout.Session.create(
-                mode="payment" if float(plan.price) > 0 else "subscription",
-                line_items=[{"price": plan.stripe_price_id or settings.STRIPE_PRICE_ID_PRO, "quantity": 1}] if plan.price > 0 else [],
-                success_url=f"{settings.APP_BASE_URL}/?checkout=success&plan={plan.code}&usuario={request.usuario}",
-                cancel_url=f"{settings.APP_BASE_URL}/?checkout=cancel&plan={plan.code}&usuario={request.usuario}",
-                customer_email=request.usuario + "@georescue.local",
-                metadata={"usuario": request.usuario, "plan_code": plan.code},
+        if plan.tier == "enterprise":
+            raise ValueError(
+                "El plan Enterprise es para instituciones públicas. Regístrate como 'Institución pública' para solicitarlo."
             )
 
-            subscription = self.db.query(UserSubscription).filter(
-                UserSubscription.usuario == request.usuario,
-                UserSubscription.plan_code == plan.code,
-                UserSubscription.status == "active",
-            ).first()
-            if not subscription:
-                self.db.add(
-                    UserSubscription(
-                        usuario=request.usuario,
-                        plan_code=plan.code,
-                        status="pending",
-                        provider="stripe",
-                        price=float(plan.price),
-                        currency=plan.currency,
-                        checkout_session_id=session.id,
-                        customer_id=session.customer,
-                        started_at=datetime.utcnow(),
-                        expires_at=datetime.utcnow() + timedelta(days=30),
-                    )
-                )
-                self.db.commit()
+        price = float(plan.price or 0.0)
+        active = self._active_subscription(usuario)
+        if active and active.plan_code == plan.code:
+            return CheckoutSessionResponse(
+                status="active",
+                provider=active.provider,
+                plan_code=plan.code,
+                usuario=usuario,
+                checkout_url=None,
+                message=f"Ya tienes activo el plan {plan.name}.",
+                requires_manual_confirmation=False,
+            )
 
+        # Una sola solicitud en curso por usuario: se reutiliza en lugar de duplicar filas.
+        subscription = self._open_request(usuario)
+        if not subscription:
+            subscription = UserSubscription(usuario=usuario, plan_code=plan.code, started_at=datetime.utcnow())
+        subscription.plan_code = plan.code
+        subscription.price = price
+        subscription.currency = plan.currency
+        subscription.checkout_session_id = None
+
+        # Plan gratuito: se activa de inmediato, no pasa por la pasarela.
+        if price == 0:
+            subscription.provider = "system"
+            self._activate(subscription)
+            self.db.commit()
+            return CheckoutSessionResponse(
+                status="active",
+                provider="system",
+                plan_code=plan.code,
+                usuario=usuario,
+                checkout_url=None,
+                message="Plan gratuito activado.",
+                requires_manual_confirmation=False,
+            )
+
+        if self._stripe_enabled():
+            stripe.api_key = settings.STRIPE_SECRET_KEY
+            base_url = settings.APP_BASE_URL.rstrip("/")
+            params = dict(
+                mode=settings.STRIPE_CHECKOUT_MODE,
+                line_items=[{"price": plan.stripe_price_id or settings.STRIPE_PRICE_ID_PRO, "quantity": 1}],
+                # Stripe sustituye {CHECKOUT_SESSION_ID}; el frontend lo usa para confirmar el pago.
+                success_url=f"{base_url}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{base_url}/?checkout=cancel",
+                client_reference_id=usuario,
+                metadata={"usuario": usuario, "plan_code": plan.code},
+            )
+            if "@" in usuario:
+                params["customer_email"] = usuario
+            try:
+                session = stripe.checkout.Session.create(**params)
+            except Exception as exc:
+                raise ValueError(f"La pasarela de pagos rechazó la solicitud: {exc}") from exc
+
+            subscription.status = "pending"
+            subscription.provider = "stripe"
+            subscription.checkout_session_id = session.id
+            subscription.expires_at = None
+            self.db.add(subscription)
+            self.db.commit()
             return CheckoutSessionResponse(
                 status="pending",
                 provider="stripe",
                 plan_code=plan.code,
-                usuario=request.usuario,
+                usuario=usuario,
                 checkout_url=session.url,
-                message=f"Checkout creado para el plan {plan.name}.",
+                message=f"Checkout creado para el plan {plan.name}. Completa el pago para activarlo.",
                 requires_manual_confirmation=False,
             )
 
-        subscription = self.db.query(UserSubscription).filter(
-            UserSubscription.usuario == request.usuario,
-            UserSubscription.plan_code == plan.code,
-        ).order_by(UserSubscription.created_at.desc()).first()
-
-        if not subscription:
-            subscription = UserSubscription(
-                usuario=request.usuario,
-                plan_code=plan.code,
-                status="active" if plan.price == 0 else "manual_review",
-                provider="manual",
-                price=float(plan.price),
-                currency=plan.currency,
-                started_at=datetime.utcnow(),
-                expires_at=datetime.utcnow() + timedelta(days=30),
-            )
-            self.db.add(subscription)
-            self.db.commit()
-            self.db.refresh(subscription)
-
+        # Sin pasarela configurada: el usuario paga por fuera, reporta la operación y el
+        # propietario la valida contra su cuenta antes de activar el plan.
+        metodo, referencia = self._validar_pago_reportado(request, usuario)
+        subscription.status = "manual_review"
+        subscription.provider = "manual"
+        subscription.payment_method = metodo
+        subscription.payment_reference = referencia
+        subscription.expires_at = None
+        self.db.add(subscription)
+        self.db.commit()
         return CheckoutSessionResponse(
-            status="active" if plan.price == 0 else "manual_review",
+            status="manual_review",
             provider="manual",
             plan_code=plan.code,
-            usuario=request.usuario,
+            usuario=usuario,
             checkout_url=None,
             message=(
-                "El plan está activado en modo de desarrollo local. "
-                "Configura STRIPE_SECRET_KEY para habilitar pagos reales en producción."
-                if plan.price > 0 else "Plan gratuito activado."
+                f"Pago del plan {plan.name} registrado ({self.METODOS_DE_PAGO[metodo]}, operación {referencia}). "
+                "Se activará cuando los propietarios de la plataforma lo validen."
             ),
-            requires_manual_confirmation=plan.price > 0,
+            requires_manual_confirmation=True,
         )
 
+    def confirm_checkout(self, usuario: str, session_id: str) -> SubscriptionStatusResponse:
+        """Consulta a Stripe si la sesión de checkout quedó pagada y, si es así, activa el plan."""
+        subscription = self.db.query(UserSubscription).filter(
+            UserSubscription.usuario == usuario,
+            UserSubscription.checkout_session_id == session_id,
+        ).first()
+        if not subscription:
+            raise ValueError("No existe un pago en curso con ese identificador para tu cuenta.")
+        if subscription.status == "pending":
+            if not self._stripe_enabled():
+                raise ValueError("La pasarela de pagos no está configurada en el servidor.")
+            stripe.api_key = settings.STRIPE_SECRET_KEY
+            try:
+                session = stripe.checkout.Session.retrieve(session_id)
+            except Exception as exc:
+                raise ValueError(f"No se pudo consultar el pago en la pasarela: {exc}") from exc
+            if getattr(session, "payment_status", None) in ("paid", "no_payment_required"):
+                subscription.customer_id = getattr(session, "customer", None)
+                self._activate(subscription)
+                self.db.commit()
+        return self.get_user_subscription(usuario)
+
+    def list_payment_requests(self, status_filter: str = "manual_review") -> List[UserSubscription]:
+        query = self.db.query(UserSubscription).filter(UserSubscription.provider != "system")
+        if status_filter != "all":
+            query = query.filter(UserSubscription.status == status_filter)
+        return query.order_by(UserSubscription.id.desc()).limit(200).all()
+
+    def review_payment(self, subscription_id: int, approve: bool) -> UserSubscription:
+        subscription = self.db.query(UserSubscription).filter(
+            UserSubscription.id == subscription_id,
+            UserSubscription.status == "manual_review",
+        ).first()
+        if not subscription:
+            raise ValueError("El pago no existe o ya fue revisado.")
+        if approve:
+            self._activate(subscription)
+        else:
+            subscription.status = "rejected"
+            self.db.add(subscription)
+        self.db.commit()
+        self.db.refresh(subscription)
+        return subscription
+
     def get_user_subscription(self, usuario: str) -> SubscriptionStatusResponse:
-        latest = self.db.query(UserSubscription).filter(UserSubscription.usuario == usuario).order_by(UserSubscription.created_at.desc()).first()
-        if not latest:
+        active = self._active_subscription(usuario)
+        open_request = self._open_request(usuario)
+        pending_plan_code = open_request.plan_code if open_request else None
+        pending_status = open_request.status if open_request else None
+        if not active:
             free_plan = self.get_plan_by_code("free")
             return SubscriptionStatusResponse(
                 usuario=usuario,
@@ -515,18 +674,21 @@ class SubscriptionService:
                 provider="system",
                 price=float(free_plan.price) if free_plan else 0.0,
                 currency="PEN",
-                started_at=datetime.utcnow().isoformat(),
+                started_at=None,
                 expires_at=None,
+                pending_plan_code=pending_plan_code,
+                pending_status=pending_status,
             )
 
-        plan = self.get_plan_by_code(latest.plan_code) or self.db.query(PlanCatalog).filter(PlanCatalog.code == latest.plan_code).first()
         return SubscriptionStatusResponse(
-            usuario=latest.usuario,
-            plan_code=latest.plan_code,
-            status=latest.status,
-            provider=latest.provider,
-            price=float(latest.price or (plan.price if plan else 0.0)),
-            currency=latest.currency or (plan.currency if plan else "PEN"),
-            started_at=latest.started_at.isoformat() if latest.started_at else None,
-            expires_at=latest.expires_at.isoformat() if latest.expires_at else None,
+            usuario=active.usuario,
+            plan_code=active.plan_code,
+            status=active.status,
+            provider=active.provider,
+            price=float(active.price or 0.0),
+            currency=active.currency or "PEN",
+            started_at=active.started_at.isoformat() if active.started_at else None,
+            expires_at=active.expires_at.isoformat() if active.expires_at else None,
+            pending_plan_code=pending_plan_code,
+            pending_status=pending_status,
         )

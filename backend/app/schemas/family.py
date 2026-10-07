@@ -14,7 +14,7 @@ class FamiliarResponse(BaseModel):
     nombre: str
     parentesco: str
     dispositivo_id: Optional[str] = None
-    creado_en: datetime
+    creado_en: Optional[datetime] = None
 
     class Config:
         from_attributes = True

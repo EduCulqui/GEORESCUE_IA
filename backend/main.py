@@ -17,6 +17,15 @@ import app.models
 # Intentar inicialización de esquema si PostgreSQL está en línea
 try:
     Base.metadata.create_all(bind=engine)
+    # create_all no agrega columnas a tablas que ya existen: se añaden aquí las nuevas.
+    # (Equivale a database/migrations/20261007_pagos_reportados.sql; es seguro repetirlo.)
+    from sqlalchemy import text
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS payment_method VARCHAR(40)"))
+        connection.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS payment_reference VARCHAR(120)"))
+except UnicodeDecodeError:
+    # En Windows en español, psycopg2 no logra leer el mensaje de error de PostgreSQL (tildes).
+    print("Nota: PostgreSQL rechazó la conexión. Revisa DB_USER, DB_PASSWORD y DB_NAME en el archivo .env. Iniciando API...")
 except Exception as e:
     print(f"Nota: No se pudo conectar a la BD durante el arranque ({e}). Iniciando API...")
 

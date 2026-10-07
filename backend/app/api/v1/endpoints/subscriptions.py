@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db, require_permission
 from app.schemas.subscription import (
     CheckoutSessionResponse,
+    ConfirmCheckoutRequest,
     CreateCheckoutRequest,
     InstitutionMemberRequest,
     InstitutionMemberResponse,
@@ -12,6 +13,7 @@ from app.schemas.subscription import (
     InstitutionAccountResponse,
     InstitutionPlanUpdate,
     InstitutionPricingResponse,
+    PaymentInfoResponse,
     PlanItem,
     SubscriptionStatusResponse,
 )
@@ -37,22 +39,57 @@ def listar_planes(db: Session = Depends(get_db)):
     return service.list_plans()
 
 
+@router.get("/payment-info", response_model=PaymentInfoResponse)
+def consultar_datos_de_pago(db: Session = Depends(get_db)):
+    """Datos de cobro (Yape, Plin, transferencia) que muestra el formulario de pago."""
+    return SubscriptionService(db).get_payment_info()
+
+
 @router.post("/checkout", response_model=CheckoutSessionResponse)
 def crear_checkout(
     payload: CreateCheckoutRequest,
+    user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Crea un checkout real con Stripe cuando existe clave configurada; si no, usa un fallback local de desarrollo."""
+    """Inicia la contratación de un plan para la cuenta autenticada.
+
+    Con STRIPE_SECRET_KEY configurada devuelve la URL de pago de Stripe. Sin ella, el usuario
+    reporta el pago que hizo por fuera (método y número de operación) y la solicitud queda en
+    'manual_review' hasta que un propietario de la plataforma lo valide.
+    """
     service = SubscriptionService(db)
+    # El titular siempre es quien inició sesión: nadie puede contratar a nombre de otro usuario.
+    payload.usuario = user["sub"]
     try:
         return service.create_checkout(payload)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
+@router.post("/checkout/confirm", response_model=SubscriptionStatusResponse)
+def confirmar_checkout(
+    payload: ConfirmCheckoutRequest,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Se llama al volver de Stripe: verifica el pago en la pasarela y activa el plan."""
+    try:
+        return SubscriptionService(db).confirm_checkout(user["sub"], payload.session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/me", response_model=SubscriptionStatusResponse)
+def consultar_mi_plan(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Plan vigente de la cuenta autenticada y, si existe, la solicitud de cambio en curso."""
+    return SubscriptionService(db).get_user_subscription(user["sub"])
+
+
 @router.get("/status/{usuario}", response_model=SubscriptionStatusResponse)
-def consultar_estado_plan(usuario: str, db: Session = Depends(get_db)):
-    """Consulta el plan activo del usuario."""
+def consultar_estado_plan(usuario: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Consulta el plan activo del usuario (solo el propio)."""
+    if usuario != user["sub"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Solo puedes consultar tu propio plan.")
     service = SubscriptionService(db)
     return service.get_user_subscription(usuario)
 

@@ -9,7 +9,7 @@ from app.schemas.auth import RegistroRequest, LoginRequest, AuthResponse
 from app.core.security import hash_password, verify_password, generar_codigo_enlace, create_access_token, build_permissions_for_role, normalize_role
 from app.models.subscription import InstitutionAccount, InstitutionApplication, InstitutionInvite, InstitutionMember
 from app.models.user import Usuario
-from app.domain.exceptions import EntityAlreadyExistsException, InvalidCredentialsException
+from app.domain.exceptions import DomainException, EntityAlreadyExistsException, ForbiddenException, InvalidCredentialsException
 
 class AuthService(BaseService):
     """Servicio de autenticación, emisión de credenciales y autorización RBAC."""
@@ -35,7 +35,7 @@ class AuthService(BaseService):
         if data.modo == "institucional":
             institution_name = (data.nombre_institucion or "").strip()
             if not institution_name:
-                raise InvalidCredentialsException("Indica el nombre de la institución pública.")
+                raise DomainException("Indica el nombre de la institución pública.", code="VALIDATION_ERROR")
             required_application_fields = {
                 "RUC": data.ruc_institucion,
                 "tipo de institución": data.tipo_institucion,
@@ -47,11 +47,12 @@ class AuthService(BaseService):
             }
             missing_fields = [label for label, value in required_application_fields.items() if not value or not value.strip()]
             if missing_fields:
-                raise InvalidCredentialsException(
-                    "Completa los datos de verificación institucional: " + ", ".join(missing_fields)
+                raise DomainException(
+                    "Completa los datos de verificación institucional: " + ", ".join(missing_fields),
+                    code="VALIDATION_ERROR",
                 )
             if not data.evidencia_institucional_url.startswith("https://"):
-                raise InvalidCredentialsException("El enlace de evidencia debe usar HTTPS.")
+                raise DomainException("El enlace de evidencia debe usar HTTPS.", code="VALIDATION_ERROR")
             existing_institution = self.db.query(InstitutionAccount).filter(
                 InstitutionAccount.institution_name == institution_name
             ).first() if institution_name else None
@@ -62,23 +63,38 @@ class AuthService(BaseService):
             ).first()
             if existing_ruc:
                 raise EntityAlreadyExistsException("RUC", data.ruc_institucion)
+            if existente:
+                solicitud_pendiente = self.db.query(InstitutionApplication).filter(
+                    InstitutionApplication.applicant_username == existente.usuario,
+                    InstitutionApplication.status == "pending",
+                ).first()
+                if solicitud_pendiente:
+                    raise EntityAlreadyExistsException("Solicitud institucional pendiente de", existente.usuario)
             from app.services.subscription_service import SubscriptionService
 
             plan = SubscriptionService(self.db).get_plan_by_code("enterprise")
             if not plan:
-                raise InvalidCredentialsException("El plan institucional no está disponible.")
+                raise DomainException("El plan institucional no está disponible.", code="PLAN_UNAVAILABLE")
             role = "director"
             permissions = build_permissions_for_role(role)
-            code = generar_codigo_enlace()
-            institution_user = existente or Usuario(
-                usuario=data.usuario,
-                password=hash_password(data.password),
-                codigo_enlace=code,
-            )
-            institution_user.rol = role
-            institution_user.institucion = institution_name
-            institution_user.permisos = json.dumps(permissions)
-            institution_user.is_active = 0
+            es_conversion = existente is not None
+            if es_conversion:
+                # Un ciudadano que solicita pasar a institucional conserva su cuenta
+                # ciudadana activa (y su acceso al SOS) hasta que la solicitud se apruebe.
+                # El rol de director se asigna recién en la aprobación.
+                institution_user = existente
+                code = existente.codigo_enlace
+            else:
+                code = generar_codigo_enlace()
+                institution_user = Usuario(
+                    usuario=data.usuario,
+                    password=hash_password(data.password),
+                    codigo_enlace=code,
+                    rol=role,
+                    institucion=institution_name,
+                    permisos=json.dumps(permissions),
+                    is_active=0,
+                )
             institution = InstitutionAccount(
                 institution_name=institution_name,
                 plan_code=plan.code,
@@ -105,12 +121,19 @@ class AuthService(BaseService):
                 self.db.rollback()
                 raise EntityAlreadyExistsException("Solicitud institucional", institution_name) from exc
             self.db.refresh(institution_user)
+            mensaje = (
+                "Solicitud institucional recibida. Los propietarios verificarán los datos y la evidencia antes de habilitar el acceso."
+            )
+            if es_conversion:
+                mensaje += " Mientras tanto, tu cuenta ciudadana sigue activa en el acceso Familiar."
+            # En una conversión la respuesta refleja el estado real de la cuenta (sigue siendo ciudadana).
+            rol_actual = normalize_role(institution_user.rol)
             return AuthResponse(
-                mensaje="Solicitud institucional recibida. Los propietarios verificarán los datos y la evidencia antes de habilitar el acceso.",
+                mensaje=mensaje,
                 usuario=institution_user.usuario,
-                rol=role,
-                institucion=institution_name,
-                permisos=permissions,
+                rol=rol_actual,
+                institucion=getattr(institution_user, "institucion", None) or "individual",
+                permisos=build_permissions_for_role(rol_actual),
                 token=None,
                 codigo_enlace=code,
             )
@@ -161,14 +184,24 @@ class AuthService(BaseService):
             raise InvalidCredentialsException("Usuario o contraseña incorrectos.")
 
         # 2. Verificar hash
-        if not getattr(usuario, "is_active", 1) or not verify_password(data.password, usuario.password):
+        if not verify_password(data.password, usuario.password):
             raise InvalidCredentialsException("Usuario o contraseña incorrectos.")
+
+        # 2.1 Cuenta desactivada: solo con la contraseña correcta se explica el motivo,
+        # para que un director pendiente no vea un falso "contraseña incorrecta".
+        if not getattr(usuario, "is_active", 1):
+            raise ForbiddenException(self._motivo_cuenta_inactiva(usuario))
 
         rol = normalize_role(getattr(usuario, "rol", "ciudadano"))
         institucion = getattr(usuario, "institucion", data.institucion or "individual")
         es_cuenta_institucional = rol != "ciudadano" and institucion != "individual"
         if (data.modo == "institucional") != es_cuenta_institucional:
-            raise InvalidCredentialsException("Las credenciales no corresponden al modo de acceso seleccionado.")
+            # La contraseña ya se verificó, así que se puede indicar la pestaña correcta.
+            raise InvalidCredentialsException(
+                "Esta cuenta es institucional: ingresa por la pestaña 'Institucional'."
+                if es_cuenta_institucional
+                else "Esta cuenta es ciudadana: ingresa por la pestaña 'Familiar'."
+            )
         permisos = build_permissions_for_role(rol)
 
         # 3. Generar Token JWT con claims
@@ -189,6 +222,19 @@ class AuthService(BaseService):
             token=token,
             codigo_enlace=usuario.codigo_enlace
         )
+
+    def _motivo_cuenta_inactiva(self, usuario: Usuario) -> str:
+        solicitud = self.db.query(InstitutionApplication).filter(
+            InstitutionApplication.applicant_username == usuario.usuario
+        ).order_by(InstitutionApplication.id.desc()).first()
+        if solicitud and solicitud.status == "pending":
+            return (
+                "Tu solicitud institucional está pendiente de revisión. "
+                "Podrás ingresar cuando los propietarios de la plataforma la aprueben."
+            )
+        if solicitud and solicitud.status == "rejected":
+            return "Tu solicitud institucional fue rechazada. Contacta a los propietarios de la plataforma."
+        return "Tu cuenta está desactivada. Contacta al coordinador de tu institución."
 
     def aceptar_invitacion(self, token: str, password: str) -> AuthResponse:
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()

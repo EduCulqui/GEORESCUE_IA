@@ -149,7 +149,7 @@
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <div class="bg-slate-950 border border-slate-800 rounded-2xl p-3">
                         <div class="text-[10px] uppercase tracking-wider text-slate-400">Free</div>
-                        <div class="mt-2 text-2xl font-black text-white">S/0</div>
+                        <div data-plan-price="free" class="mt-2 text-2xl font-black text-white">S/0</div>
                         <ul class="mt-3 text-[11px] text-slate-300 space-y-1.5">
                             <li>• 1 usuario</li>
                             <li>• SOS básico</li>
@@ -162,7 +162,7 @@
 
                     <div class="bg-gradient-to-b from-red-950/40 to-slate-950 border border-red-700/60 rounded-2xl p-3 shadow-lg shadow-red-900/20">
                         <div class="text-[10px] uppercase tracking-wider text-red-300">Pro</div>
-                        <div class="mt-2 text-2xl font-black text-white">S/39</div>
+                        <div data-plan-price="pro" class="mt-2 text-2xl font-black text-white">S/39</div>
                         <ul class="mt-3 text-[11px] text-slate-200 space-y-1.5">
                             <li>• Alertas avanzadas</li>
                             <li>• Mapa geolocalizado</li>
@@ -186,7 +186,41 @@
                         </button>
                     </div>
                 </div>
+                <div id="planes-feedback" class="mt-3 text-xs text-center text-amber-300 min-h-[1rem]" role="status"></div>
             </div>
+        </div>
+    </div>
+
+    <!-- Formulario de pago reportado (Yape / Plin / transferencia) -->
+    <div id="modal-pago" class="hidden fixed inset-0 z-[2000] overflow-y-auto bg-black/70 p-4" role="dialog" aria-modal="true" aria-labelledby="modal-pago-titulo">
+        <div class="flex min-h-full items-center justify-center">
+        <form id="form-pago" onsubmit="App.enviarPagoReportado(event)" class="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-6 text-left shadow-2xl">
+            <h2 id="modal-pago-titulo" class="text-lg font-bold text-white">Activar plan</h2>
+            <p class="mt-1 text-xs text-slate-400">Paga el monto indicado por cualquiera de estos medios y registra aquí tu operación. El plan se activa cuando validamos el pago.</p>
+
+            <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950 p-4">
+                <div class="flex items-baseline justify-between">
+                    <span class="text-xs uppercase tracking-wider text-slate-400">Monto a pagar</span>
+                    <span id="modal-pago-monto" class="text-2xl font-black text-white">S/ --</span>
+                </div>
+                <p class="mt-3 text-[11px] text-slate-400">Titular: <span id="modal-pago-titular" class="font-semibold text-slate-200">--</span></p>
+                <ul id="modal-pago-destinos" class="mt-2 space-y-1 text-xs text-slate-200"></ul>
+            </div>
+
+            <label for="pago-metodo" class="mt-4 block text-xs font-semibold text-slate-300">¿Con qué medio pagaste?</label>
+            <select id="pago-metodo" required class="mt-1.5 w-full rounded-xl border border-slate-800 bg-slate-950 px-4 py-3 text-sm text-white"></select>
+
+            <label for="pago-referencia" class="mt-4 block text-xs font-semibold text-slate-300">Número de operación</label>
+            <input id="pago-referencia" type="text" required minlength="4" maxlength="120" autocomplete="off" oninput="document.getElementById('pago-feedback').textContent = ''" placeholder="Ej. 01234567" class="mt-1.5 w-full rounded-xl border border-slate-800 bg-slate-950 px-4 py-3 text-sm text-white placeholder-slate-600" />
+            <p class="mt-1 text-[11px] text-slate-500">Aparece en el comprobante de tu Yape, Plin o transferencia.</p>
+
+            <div id="pago-feedback" class="mt-3 min-h-[1rem] text-xs text-red-400" role="status"></div>
+
+            <div class="mt-4 flex justify-end gap-2">
+                <button type="button" onclick="App.cerrarFormularioPago()" class="rounded-xl border border-slate-700 px-4 py-2.5 text-xs font-semibold text-slate-200 hover:bg-slate-800">Cancelar</button>
+                <button type="submit" id="pago-enviar" class="rounded-xl bg-red-600 px-4 py-2.5 text-xs font-bold text-white hover:bg-red-500">Registrar mi pago</button>
+            </div>
+        </form>
         </div>
     </div>
 
@@ -229,6 +263,17 @@
             </div>
             <div id="owner-applications-feedback" class="mb-4 text-xs text-slate-400" role="status"></div>
             <div id="owner-applications-list" class="grid grid-cols-1 gap-4 lg:grid-cols-2"></div>
+
+            <div class="mt-10 border-t border-slate-800 pt-6">
+                <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                        <h2 class="text-base font-bold text-white">Pagos por validar</h2>
+                        <p class="mt-1 max-w-2xl text-xs leading-relaxed text-slate-400">Solicitudes de plan de pago registradas sin pasarela. Aprueba solo después de comprobar que el pago se recibió.</p>
+                    </div>
+                    <span id="owner-payments-feedback" class="text-xs text-slate-400" role="status"></span>
+                </div>
+                <div id="owner-payments-list" class="grid grid-cols-1 gap-3 lg:grid-cols-2"></div>
+            </div>
             </div>
         </section>
     </main>
@@ -260,6 +305,7 @@
                     <h1 class="font-bold text-sm text-white flex items-center gap-2">
                         GEORESCUE <span class="text-red-500 font-extrabold">IA</span>
                         <span id="badge-rol" class="text-[10px] bg-red-950/70 text-red-300 border border-red-800 px-2 py-0.5 rounded-md font-mono">B2C</span>
+                        <button type="button" id="btn-mejorar-plan" onclick="App.contratarPlan('pro')" class="hidden text-[10px] font-semibold bg-red-600 hover:bg-red-500 text-white px-2 py-0.5 rounded-md transition">Mejorar a Pro</button>
                     </h1>
                     <p class="text-[11px] text-slate-400">Sistema Geoespacial con PostGIS & Detección Inercial</p>
                 </div>

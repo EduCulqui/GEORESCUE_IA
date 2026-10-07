@@ -28,10 +28,21 @@ const App = {
         this.verificarSesionPrevia();
         this.inicializarModuloAntirrobo();
         this.inicializarPlanesPago();
+        this.cargarPreciosPlanes();
         this.inicializarAccesoInstitucional();
         this.inicializarAceptacionInvitacion();
         this.inicializarPanelAdministracion();
+        this.inicializarValidacionDePagos();
         this.restaurarSesionPropietarios();
+    },
+
+    // El backend guarda las fechas en UTC sin indicar la zona. Se marcan como UTC
+    // para que el navegador las muestre en la hora local del usuario.
+    formatearFecha(valor) {
+        if (!valor) return '—';
+        const texto = String(valor);
+        const iso = /(Z|[+-]\d{2}:\d{2})$/.test(texto) ? texto : `${texto}Z`;
+        return new Date(iso).toLocaleString();
     },
 
     mostrarLoginPropietarios() {
@@ -172,12 +183,35 @@ const App = {
         });
     },
 
+    inicializarValidacionDePagos() {
+        if (this._ownerPaymentsHooked) return;
+        this._ownerPaymentsHooked = true;
+        document.getElementById('owner-payments-list')?.addEventListener('click', async (event) => {
+            const button = event.target.closest('[data-payment-action]');
+            if (!button) return;
+            const paymentId = Number(button.closest('[data-owner-payment]')?.dataset.ownerPayment);
+            const approve = button.dataset.paymentAction === 'approve';
+            const pregunta = approve
+                ? '¿Confirmas que el pago fue recibido? El plan se activará de inmediato.'
+                : '¿Confirmas el rechazo? El usuario conservará su plan actual.';
+            if (!window.confirm(pregunta)) return;
+            button.disabled = true;
+            try {
+                await ApiService.revisarPago(paymentId, approve ? 'approve' : 'reject');
+            } catch (error) {
+                alert(`No se pudo registrar la decisión: ${error.message}`);
+            }
+            await this.cargarPagosPorValidar();
+        });
+    },
+
     async cargarSolicitudesInstitucionales() {
         const list = document.getElementById('owner-applications-list');
         const feedback = document.getElementById('owner-applications-feedback');
         if (!list || !sessionStorage.getItem('qgeo_owner_token') || sessionStorage.getItem('qgeo_owner_must_change_password') === 'true') return;
         const statusFilter = document.getElementById('owner-application-filter').value;
         feedback.textContent = 'Cargando solicitudes...';
+        this.cargarPagosPorValidar();
         try {
             const applications = await ApiService.listarSolicitudesInstitucionales(statusFilter);
             feedback.textContent = `${applications.length} solicitud(es)`;
@@ -203,7 +237,7 @@ const App = {
                             <div><dt class="text-slate-500">Teléfono</dt><dd class="text-slate-200">${this.escaparTexto(application.contact_phone)}</dd></div>
                             <div class="sm:col-span-2"><dt class="text-slate-500">Correo institucional</dt><dd class="text-slate-200">${this.escaparTexto(application.official_email)}</dd></div>
                             <div class="sm:col-span-2"><dt class="text-slate-500">Evidencia presentada</dt><dd><a class="break-all text-cyan-300 underline" href="${this.escaparTexto(application.evidence_url)}" target="_blank" rel="noopener noreferrer">Abrir enlace declarado</a></dd></div>
-                            <div class="sm:col-span-2"><dt class="text-slate-500">Recibida</dt><dd class="text-slate-200">${this.escaparTexto(new Date(application.submitted_at).toLocaleString())}</dd></div>
+                            <div class="sm:col-span-2"><dt class="text-slate-500">Recibida</dt><dd class="text-slate-200">${this.escaparTexto(this.formatearFecha(application.submitted_at))}</dd></div>
                         </dl>
                         ${pending ? `
                             <div class="mt-4 space-y-3 border-t border-slate-800 pt-4">
@@ -228,7 +262,7 @@ const App = {
         } catch (error) {
             feedback.textContent = error.message;
             list.innerHTML = '';
-            if (error.message.includes('401') || error.message.includes('403')) this.cerrarSesionPropietarios();
+            if (error.status === 401 || error.status === 403) this.cerrarSesionPropietarios();
         }
     },
 
@@ -405,7 +439,7 @@ const App = {
         this.socketInstitucional?.close();
         const token = localStorage.getItem(CONFIG.STORAGE_KEYS.TOKEN);
         if (!token || !this.institucionActual || this.rolActual === 'ciudadano') return;
-        const apiHost = CONFIG.API_HOSTS[0].replace(/^http/, 'ws');
+        const apiHost = (ApiService.hostActivo || CONFIG.API_HOSTS[0]).replace(/^http/, 'ws');
         const socket = new WebSocket(`${apiHost}${CONFIG.API_PREFIX}/realtime/ws/alerts`);
         this.socketInstitucional = socket;
         socket.addEventListener('open', () => socket.send(JSON.stringify({ token })));
@@ -424,21 +458,234 @@ const App = {
         });
     },
 
+    // ==========================================
+    // PLANES Y PAGOS
+    // ==========================================
+    NOMBRES_PLAN: { free: 'Free', pro: 'Pro', enterprise: 'Enterprise' },
+    NOMBRES_METODO_PAGO: { yape: 'Yape', plin: 'Plin', transferencia: 'Transferencia bancaria' },
+
+    mostrarMensajePlanes(mensaje) {
+        const feedback = document.getElementById('planes-feedback');
+        if (feedback) feedback.textContent = mensaje;
+    },
+
     inicializarPlanesPago() {
         document.querySelectorAll('.plan-select').forEach((button) => {
-            button.addEventListener('click', async () => {
+            button.addEventListener('click', () => {
                 const planCode = button.dataset.plan;
-                const usuario = this.usuarioActual || document.getElementById('login-usuario')?.value.trim() || 'guest_user';
 
-                try {
-                    const respuesta = await ApiService.iniciarCheckoutPlan({ usuario, plan_code: planCode });
-                    const statusText = respuesta.status === 'active' ? 'activado' : respuesta.status === 'manual_review' ? 'pendiente de validación' : 'pendiente de pago';
-                    alert(`Plan ${planCode.toUpperCase()} ${statusText}. ${respuesta.message}`);
-                } catch (err) {
-                    alert(`No se pudo iniciar la suscripción: ${err.message}`);
+                if (planCode === 'enterprise') {
+                    // Enterprise es el plan de las instituciones: se solicita con el registro institucional.
+                    this.cambiarTabAuth('registro');
+                    this.cambiarModoRegistro('institucional');
+                    this.mostrarMensajePlanes('El plan Enterprise es para instituciones públicas: completa el registro como "Institución pública".');
+                    return;
                 }
+
+                if (this.usuarioActual) {
+                    this.contratarPlan(planCode);
+                    return;
+                }
+
+                if (planCode === 'free') {
+                    this.cambiarTabAuth('registro');
+                    this.cambiarModoRegistro('familiar');
+                    this.mostrarMensajePlanes('El plan Free ya viene incluido: solo crea tu cuenta en el acceso Familiar.');
+                    return;
+                }
+
+                // Sin sesión no se registra ningún pago: se recuerda el plan y se contrata al iniciar sesión.
+                sessionStorage.setItem('qgeo_pending_plan', planCode);
+                this.mostrarMensajePlanes(`Inicia sesión o regístrate en el acceso Familiar para activar el plan ${this.NOMBRES_PLAN[planCode] || planCode}.`);
             });
         });
+    },
+
+    // Los precios se leen del backend para que la tarjeta, el formulario de pago y el
+    // panel del propietario muestren siempre el mismo monto.
+    async cargarPreciosPlanes() {
+        try {
+            const planes = await ApiService.listarPlanes();
+            this.planes = Object.fromEntries(planes.map((plan) => [plan.code, plan]));
+            document.querySelectorAll('[data-plan-price]').forEach((etiqueta) => {
+                const plan = this.planes[etiqueta.dataset.planPrice];
+                if (plan) etiqueta.textContent = `S/${Number(plan.price).toFixed(0)}`;
+            });
+        } catch (err) {
+            console.warn('No se pudo cargar el catálogo de planes:', err.message);
+        }
+    },
+
+    async contratarPlan(planCode) {
+        if (planCode === 'free') {
+            await this.enviarCheckout({ plan_code: planCode });
+            return;
+        }
+        let datosDePago;
+        try {
+            datosDePago = await ApiService.obtenerDatosDePago();
+            if (!this.planes) await this.cargarPreciosPlanes();
+        } catch (err) {
+            alert(`No se pudo iniciar la suscripción: ${err.message}`);
+            return;
+        }
+        if (datosDePago.gateway === 'stripe') {
+            // Con pasarela configurada no hay formulario propio: el pago se hace en su página.
+            await this.enviarCheckout({ plan_code: planCode });
+            return;
+        }
+        this.abrirFormularioPago(planCode, datosDePago);
+    },
+
+    // Contratación sin formulario propio: plan gratuito o pago en la página de la pasarela.
+    async enviarCheckout(payload) {
+        try {
+            const respuesta = await ApiService.iniciarCheckoutPlan(payload);
+            if (respuesta.checkout_url) {
+                this._saliendoAPago = true;
+                window.location.href = respuesta.checkout_url;
+                return;
+            }
+            this.agregarLogCiudadano(`💳 ${this.escaparTexto(respuesta.message)}`);
+            alert(respuesta.message);
+        } catch (err) {
+            alert(`No se pudo iniciar la suscripción: ${err.message}`);
+        }
+        await this.cargarPlanActual();
+    },
+
+    abrirFormularioPago(planCode, datosDePago) {
+        const plan = (this.planes || {})[planCode];
+        this._planEnPago = planCode;
+        document.getElementById('modal-pago-titulo').textContent = `Activar plan ${this.NOMBRES_PLAN[planCode] || planCode}`;
+        document.getElementById('modal-pago-monto').textContent = plan ? `S/ ${Number(plan.price).toFixed(2)}` : 'S/ --';
+        document.getElementById('modal-pago-titular').textContent = datosDePago.account_holder;
+        document.getElementById('modal-pago-destinos').innerHTML = datosDePago.methods.map((metodo) =>
+            `<li><span class="text-slate-400">${this.escaparTexto(metodo.label)}:</span> <span class="font-mono">${this.escaparTexto(metodo.destination)}</span></li>`
+        ).join('');
+        document.getElementById('pago-metodo').innerHTML = datosDePago.methods.map((metodo) =>
+            `<option value="${this.escaparTexto(metodo.code)}">${this.escaparTexto(metodo.label)}</option>`
+        ).join('');
+        document.getElementById('pago-referencia').value = '';
+        document.getElementById('pago-feedback').textContent = '';
+        document.getElementById('modal-pago').classList.remove('hidden');
+        document.getElementById('pago-referencia').focus();
+    },
+
+    cerrarFormularioPago() {
+        this._planEnPago = null;
+        document.getElementById('modal-pago')?.classList.add('hidden');
+    },
+
+    async enviarPagoReportado(event) {
+        event.preventDefault();
+        const feedback = document.getElementById('pago-feedback');
+        const boton = document.getElementById('pago-enviar');
+        const planCode = this._planEnPago;
+        if (!planCode) return;
+        feedback.textContent = '';
+        boton.disabled = true;
+        try {
+            const payload = {
+                plan_code: planCode,
+                payment_method: document.getElementById('pago-metodo').value,
+                payment_reference: document.getElementById('pago-referencia').value.trim(),
+            };
+            const respuesta = await ApiService.iniciarCheckoutPlan(payload);
+            this.cerrarFormularioPago();
+            this.agregarLogCiudadano(`💳 ${this.escaparTexto(respuesta.message)}`);
+            alert(respuesta.message);
+            await this.cargarPlanActual();
+        } catch (err) {
+            // El formulario queda abierto para que el usuario corrija el dato.
+            feedback.textContent = err.message;
+        } finally {
+            boton.disabled = false;
+        }
+    },
+
+    async procesarPlanPendiente() {
+        const planCode = sessionStorage.getItem('qgeo_pending_plan');
+        if (!planCode) return;
+        sessionStorage.removeItem('qgeo_pending_plan');
+        this.mostrarMensajePlanes('');
+        await this.contratarPlan(planCode);
+    },
+
+    // Al volver de la pasarela (?checkout=success&session_id=...) se confirma el pago en el backend.
+    async procesarRetornoDePago() {
+        const params = new URLSearchParams(window.location.search);
+        const estado = params.get('checkout');
+        if (!estado) return;
+        const sessionId = params.get('session_id');
+        ['checkout', 'session_id', 'plan', 'usuario'].forEach((clave) => params.delete(clave));
+        history.replaceState({}, '', `${location.pathname}${params.size ? `?${params}` : ''}`);
+
+        if (estado === 'cancel') {
+            alert('Pago cancelado. Tu plan no cambió.');
+            return;
+        }
+        if (estado !== 'success' || !sessionId) return;
+        try {
+            const plan = await ApiService.confirmarCheckout(sessionId);
+            alert(plan.pending_plan_code
+                ? 'El pago todavía no figura como completado. Tu plan se activará cuando la pasarela lo confirme.'
+                : `Pago confirmado. Plan ${this.NOMBRES_PLAN[plan.plan_code] || plan.plan_code} activo.`);
+        } catch (err) {
+            alert(`No se pudo confirmar el pago: ${err.message}`);
+        }
+    },
+
+    async cargarPlanActual() {
+        const badge = document.getElementById('badge-rol');
+        if (!badge || !this.usuarioActual || this.institucionActual !== 'individual') return;
+        try {
+            const plan = await ApiService.obtenerMiPlan();
+            const nombre = this.NOMBRES_PLAN[plan.plan_code] || plan.plan_code;
+            const enCurso = plan.pending_plan_code
+                ? ` (${this.NOMBRES_PLAN[plan.pending_plan_code] || plan.pending_plan_code} ${plan.pending_status === 'manual_review' ? 'en validación' : 'pendiente de pago'})`
+                : '';
+            badge.innerText = `B2C - Ciudadano · Plan ${nombre}${enCurso}`;
+            // El botón de mejora solo se ofrece a quien está en Free y no tiene un pago en revisión.
+            document.getElementById('btn-mejorar-plan')?.classList.toggle(
+                'hidden', plan.plan_code !== 'free' || Boolean(plan.pending_plan_code)
+            );
+        } catch (err) {
+            console.warn('No se pudo consultar el plan:', err.message);
+        }
+    },
+
+    async cargarPagosPorValidar() {
+        const list = document.getElementById('owner-payments-list');
+        const feedback = document.getElementById('owner-payments-feedback');
+        if (!list || !sessionStorage.getItem('qgeo_owner_token')) return;
+        try {
+            const pagos = await ApiService.listarPagosPorValidar();
+            if (feedback) feedback.textContent = `${pagos.length} pago(s) por validar`;
+            if (!pagos.length) {
+                list.innerHTML = '<p class="text-sm text-slate-400">No hay pagos pendientes de validación.</p>';
+                return;
+            }
+            list.innerHTML = pagos.map((pago) => `
+                <article data-owner-payment="${Number(pago.id)}" class="rounded-xl border border-slate-800 bg-slate-900 p-4 text-xs">
+                    <div class="flex items-start justify-between gap-3">
+                        <div>
+                            <h3 class="text-sm font-bold text-white">${this.escaparTexto(pago.usuario)}</h3>
+                            <p class="mt-1 text-slate-400">Plan ${this.escaparTexto(this.NOMBRES_PLAN[pago.plan_code] || pago.plan_code)} · ${this.escaparTexto(pago.currency)} ${Number(pago.price).toFixed(2)}</p>
+                            <p class="mt-1 text-slate-200">${this.escaparTexto(this.NOMBRES_METODO_PAGO[pago.payment_method] || pago.payment_method || 'Sin método')} · N.º de operación: <span class="font-mono font-semibold">${this.escaparTexto(pago.payment_reference || '—')}</span></p>
+                            <p class="mt-1 text-slate-500">Solicitado: ${this.escaparTexto(this.formatearFecha(pago.created_at))}</p>
+                        </div>
+                        <span class="rounded-md border border-amber-700 px-2 py-1 text-[10px] uppercase text-amber-200">Por validar</span>
+                    </div>
+                    <div class="mt-3 flex justify-end gap-2">
+                        <button type="button" data-payment-action="reject" class="rounded-lg border border-red-800 px-3 py-2 text-xs text-red-300 hover:bg-red-950">Rechazar</button>
+                        <button type="button" data-payment-action="approve" class="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-600">Pago recibido: activar plan</button>
+                    </div>
+                </article>`).join('');
+        } catch (error) {
+            if (feedback) feedback.textContent = error.message;
+            list.innerHTML = '';
+        }
     },
 
     inicializarModuloAntirrobo() {
@@ -448,7 +695,7 @@ const App = {
         this._antiTheftHooked = true;
 
         window.addEventListener('beforeunload', (event) => {
-            if (this.usuarioActual) {
+            if (this.usuarioActual && !this._saliendoAPago) {
                 event.preventDefault();
                 event.returnValue = '';
                 this.mostrarPantallaSeñuelo(
@@ -724,7 +971,7 @@ const App = {
                 this.iniciarSesionEnUI(data.usuario, data.rol, data.codigo_enlace, data.institucion);
             }, 400);
         } catch (err) {
-            feedback.innerHTML = `<span class="text-red-400">❌ ${err.message}</span>`;
+            feedback.innerHTML = `<span class="text-red-400">❌ ${this.escaparTexto(err.message)}</span>`;
         }
     },
 
@@ -771,7 +1018,7 @@ const App = {
                 feedback.innerHTML = '';
             }, 2500);
         } catch (err) {
-            feedback.innerHTML = `<span class="text-red-400">❌ ${err.message}</span>`;
+            feedback.innerHTML = `<span class="text-red-400">❌ ${this.escaparTexto(err.message)}</span>`;
         }
     },
 
@@ -794,9 +1041,13 @@ const App = {
             this.cargarCuentaInstitucional();
             this.cargarUsuariosInstitucionales(this.institucionActual);
             this.conectarTiempoRealInstitucional();
+            sessionStorage.removeItem('qgeo_pending_plan');
         } else {
             this.socketInstitucional?.close();
             this.configurarVistaCiudadano(codigoEnlace);
+            this.procesarRetornoDePago()
+                .then(() => this.procesarPlanPendiente())
+                .then(() => this.cargarPlanActual());
         }
     },
 
@@ -815,6 +1066,8 @@ const App = {
         this.socketInstitucional?.close();
         this.socketInstitucional = null;
 
+        this.cerrarFormularioPago();
+        document.getElementById('btn-mejorar-plan')?.classList.add('hidden');
         document.getElementById('pantalla-dashboard').classList.add('hidden');
         document.getElementById('pantalla-auth').classList.remove('hidden');
         document.getElementById('login-password').value = '';

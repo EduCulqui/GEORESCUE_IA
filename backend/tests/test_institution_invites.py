@@ -104,12 +104,23 @@ class TestInstitutionInvites(unittest.TestCase):
         institution = self.session.query(InstitutionAccount).filter(
             InstitutionAccount.institution_name == "POLICIA"
         ).one()
+        application = self.session.query(InstitutionApplication).filter(
+            InstitutionApplication.applicant_username == "mcajamarca"
+        ).one()
 
-        self.assertEqual(response.rol, "director")
+        # La solicitud queda pendiente y la institución desactivada...
         self.assertIsNone(response.token)
-        self.assertEqual(account.institucion, "POLICIA")
-        self.assertEqual(account.is_active, 0)
+        self.assertEqual(application.status, "pending")
         self.assertFalse(institution.is_active)
+        # ...pero el ciudadano NO pierde su cuenta mientras espera la revisión.
+        self.assertEqual(response.rol, "ciudadano")
+        self.assertEqual(account.rol, "ciudadano")
+        self.assertEqual(account.institucion, "individual")
+        self.assertEqual(account.is_active, 1)
+        login = AuthService(self.session).autenticar_usuario(LoginRequest(
+            usuario="mcajamarca", password="existing-account-password", modo="familiar"
+        ))
+        self.assertEqual(login.rol, "ciudadano")
 
     def test_invitation_creates_account_and_is_single_use(self):
         raw_token = "invitation-token-for-one-time-acceptance"

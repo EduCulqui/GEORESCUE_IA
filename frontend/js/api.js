@@ -1,9 +1,35 @@
 // Servicio de conexión con la API FastAPI de QuantumGeoRescue
 const ApiService = {
+    hostActivo: null,
+
+    // El backend responde errores en tres formatos distintos:
+    //  - excepciones de dominio:  { error: true, codigo, mensaje }
+    //  - HTTPException:           { detail: "texto" }
+    //  - validación (422):        { detail: [ { loc, msg }, ... ] }
+    extraerMensajeError(data, status) {
+        if (data && typeof data === 'object') {
+            if (typeof data.mensaje === 'string' && data.mensaje) return data.mensaje;
+            if (typeof data.detail === 'string' && data.detail) return data.detail;
+            if (Array.isArray(data.detail) && data.detail.length) {
+                return data.detail.map((item) => {
+                    const campo = Array.isArray(item.loc) ? item.loc.filter((parte) => parte !== 'body').join('.') : '';
+                    return campo ? `${campo}: ${item.msg}` : String(item.msg || '');
+                }).join(' | ');
+            }
+        }
+        if (typeof data === 'string' && data) return data;
+        return `Error en el servidor (HTTP ${status})`;
+    },
+
     async request(endpoint, options = {}) {
         let ultimoError = null;
 
-        for (const host of CONFIG.API_HOSTS) {
+        // Primero el host que ya respondió antes, para no reintentar puertos apagados en cada llamada.
+        const hosts = this.hostActivo
+            ? [this.hostActivo, ...CONFIG.API_HOSTS.filter((item) => item !== this.hostActivo)]
+            : CONFIG.API_HOSTS;
+
+        for (const host of hosts) {
             const urlConPrefijo = `${host}${CONFIG.API_PREFIX}${endpoint}`;
             const urlSinPrefijo = `${host}${endpoint}`;
 
@@ -20,16 +46,24 @@ const ApiService = {
                         }
                     });
 
-                    const data = await response.json();
-                    if (!response.ok) {
-                        const msg = data.detail || (typeof data === 'string' ? data : "Error en el servidor");
-                        throw new Error(msg);
+                    let data = null;
+                    try {
+                        data = await response.json();
+                    } catch (parseError) {
+                        data = null;
                     }
+                    if (!response.ok) {
+                        const error = new Error(this.extraerMensajeError(data, response.status));
+                        error.status = response.status;
+                        error.esRespuestaHttp = true;
+                        throw error;
+                    }
+                    this.hostActivo = host;
                     return data;
                 } catch (err) {
                     ultimoError = err;
-                    // Si el servidor respondió con un error 4xx o 5xx (HTTP), lanzarlo de inmediato (no es error de red)
-                    if (err.message && !err.message.includes("fetch") && !err.message.includes("NetworkError") && !err.message.includes("Load failed")) {
+                    // Si el servidor respondió (aunque sea con 4xx/5xx) no es un error de red: se muestra tal cual.
+                    if (err.esRespuestaHttp) {
                         throw err;
                     }
                 }
@@ -37,14 +71,17 @@ const ApiService = {
         }
 
         // Si fallaron todos los hosts (servidor apagado)
-        throw new Error("El servidor Backend (FastAPI) no está iniciado en el puerto 8001. Ejecuta: uvicorn main:app --reload --port 8001");
+        throw new Error("No se pudo conectar con el Backend (FastAPI). Inícialo con: uvicorn main:app --reload --port 8001 (también se acepta el 8000)");
     },
 
     async verificarSalud() {
         for (const host of CONFIG.API_HOSTS) {
             try {
                 const res = await fetch(`${host}/`);
-                if (res.ok) return await res.json();
+                if (res.ok) {
+                    this.hostActivo = host;
+                    return await res.json();
+                }
             } catch (e) {}
         }
         throw new Error("Servidor offline");
@@ -129,6 +166,21 @@ const ApiService = {
         });
     },
 
+    async confirmarCheckout(sessionId) {
+        return this.request('/subscriptions/checkout/confirm', {
+            method: 'POST',
+            body: JSON.stringify({ session_id: sessionId })
+        });
+    },
+
+    async obtenerMiPlan() {
+        return this.request('/subscriptions/me');
+    },
+
+    async obtenerDatosDePago() {
+        return this.request('/subscriptions/payment-info');
+    },
+
     async agregarUsuarioInstitucional(payload) {
         return this.request('/subscriptions/institutions/members', {
             method: 'POST',
@@ -136,8 +188,9 @@ const ApiService = {
         });
     },
 
-    async listarUsuariosInstitucionales(institutionName) {
-        return this.request(`/subscriptions/institutions/${encodeURIComponent(institutionName)}/members`);
+    async listarUsuariosInstitucionales() {
+        // La institución sale del token; así no depende de que el nombre viaje bien en la URL.
+        return this.request('/subscriptions/institutions/me/members');
     },
 
     async obtenerCuentaInstitucional() {
@@ -187,6 +240,21 @@ const ApiService = {
             method: 'POST',
             headers: { Authorization: `Bearer ${token}` },
             body: JSON.stringify(payload)
+        });
+    },
+
+    async listarPagosPorValidar() {
+        const token = sessionStorage.getItem('qgeo_owner_token');
+        return this.request('/admin/payments?status_filter=manual_review', {
+            headers: { Authorization: `Bearer ${token}` }
+        });
+    },
+
+    async revisarPago(paymentId, action) {
+        const token = sessionStorage.getItem('qgeo_owner_token');
+        return this.request(`/admin/payments/${paymentId}/${action}`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}` }
         });
     }
 };

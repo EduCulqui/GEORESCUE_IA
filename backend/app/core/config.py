@@ -33,7 +33,9 @@ class Settings:
 
     @property
     def SQLALCHEMY_DATABASE_URL(self) -> str:
-        return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        # Driver explícito: desde SQLAlchemy 2.1 "postgresql://" busca psycopg 3 y
+        # requirements.txt instala psycopg2-binary.
+        return f"postgresql+psycopg2://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
 
     # Seguridad
     SECRET_KEY: str = os.getenv("SECRET_KEY", "quantum_secret_key_rescue_2026_super_secure")
@@ -55,6 +57,15 @@ class Settings:
     STRIPE_SECRET_KEY: str = os.getenv("STRIPE_SECRET_KEY", "")
     STRIPE_PRICE_ID_PRO: str = os.getenv("STRIPE_PRICE_ID_PRO", "price_pro_demo")
     STRIPE_PRICE_ID_ENTERPRISE: str = os.getenv("STRIPE_PRICE_ID_ENTERPRISE", "price_enterprise_demo")
+    # "subscription" si los precios de Stripe son recurrentes (mensuales); "payment" si son de pago único.
+    STRIPE_CHECKOUT_MODE: str = os.getenv("STRIPE_CHECKOUT_MODE", "subscription")
+
+    # Datos que ve el usuario para pagar por fuera (Yape / Plin / transferencia).
+    # Son valores de ejemplo: cámbialos en el archivo .env por los reales.
+    PAYMENT_ACCOUNT_HOLDER: str = os.getenv("PAYMENT_ACCOUNT_HOLDER", "GEORESCUE IA (cuenta de ejemplo)")
+    PAYMENT_YAPE_NUMBER: str = os.getenv("PAYMENT_YAPE_NUMBER", "999 999 999")
+    PAYMENT_PLIN_NUMBER: str = os.getenv("PAYMENT_PLIN_NUMBER", "999 999 999")
+    PAYMENT_BANK_ACCOUNT: str = os.getenv("PAYMENT_BANK_ACCOUNT", "BCP 000-0000000-0-00 (ejemplo)")
     DEFAULT_RESPONSE_INSTITUTION: str = os.getenv("DEFAULT_RESPONSE_INSTITUTION", "COER Cajamarca")
 
 settings = Settings()

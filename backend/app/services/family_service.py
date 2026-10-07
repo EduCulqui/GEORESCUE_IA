@@ -32,6 +32,6 @@ class FamilyService(BaseService):
                 nombre=f.nombre,
                 parentesco=f.parentesco,
                 dispositivo_id=f.dispositivo_id,
-                creado_en=f.creado_en
+                creado_en=f.created_at
             ) for f in familiares
         ]

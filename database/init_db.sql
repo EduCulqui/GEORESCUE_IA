@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS red_familiar (
     nombre VARCHAR(150) NOT NULL,
     parentesco VARCHAR(80) NOT NULL,
     dispositivo_id VARCHAR(100),
-    creado_en TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_red_familiar_responsable ON red_familiar(usuario_responsable);
